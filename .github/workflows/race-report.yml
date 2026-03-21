@@ -1,0 +1,185 @@
+# ─── Race Report: run multi-tier, update README, commit back ──────
+name: 🔵 Race Report
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/race-report.yml"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Precision tier"
+        required: false
+        default: "deep"
+        type: choice
+        options: [nano, micro, standard, deep, extreme]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  race:
+    name: Run the Race
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-race-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      # ── Run all tiers in parallel via matrix would be expensive; run
+      #    sequentially: nano, standard, deep (or whatever was dispatched)
+      - name: Run nano tier
+        run: |
+          mkdir -p race-results
+          ./target/release/pi-race --tier nano   --format markdown 2>/dev/null > race-results/nano.md
+          ./target/release/pi-race --tier nano   --format json     2>/dev/null > race-results/nano.json
+
+      - name: Run standard tier
+        run: |
+          ./target/release/pi-race --tier standard --format markdown 2>/dev/null > race-results/standard.md
+          ./target/release/pi-race --tier standard --format json     2>/dev/null > race-results/standard.json
+
+      - name: Run deep tier
+        run: |
+          TIER=${{ github.event.inputs.tier || 'deep' }}
+          ./target/release/pi-race --tier $TIER --format markdown 2>/dev/null > race-results/deep.md
+          ./target/release/pi-race --tier $TIER --format json     2>/dev/null > race-results/deep.json
+
+      - name: Build combined README section
+        run: |
+          python3 << 'PYEOF'
+          import json, datetime, os
+
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          sha     = os.environ['GITHUB_SHA'][:7]
+          ts      = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+          # Load JSON results for the badge-style summary
+          with open('race-results/deep.json') as f:
+              data = json.load(f)
+
+          winner = max(data['algorithms'], key=lambda a: a['best_digits'])
+
+          lines = []
+          lines.append("<!-- RACE_RESULTS_START -->")
+          lines.append("")
+          lines.append("## 🏁 Latest Race Results")
+          lines.append("")
+          lines.append(f"> 🕐 **Updated:** {ts} &nbsp;|&nbsp; **Commit:** [`{sha}`]({run_url}) &nbsp;|&nbsp; **Winner:** **{winner['name']}** with `{winner['best_digits']}` correct digits")
+          lines.append("")
+
+          # Quick-look summary table
+          lines.append("### Quick Look — Deep Tier")
+          lines.append("")
+          lines.append("| Algorithm | Best Digits | Estimate | Error |")
+          lines.append("|-----------|-------------|----------|-------|")
+          medals = ["🥇","🥈","🥉","4️⃣"]
+          sorted_algos = sorted(data['algorithms'], key=lambda a: -a['best_digits'])
+          for i, algo in enumerate(sorted_algos):
+              lines.append(
+                  f"| {medals[i]} **{algo['name']}** | `{algo['best_digits']}` "
+                  f"| `{algo['best_estimate']:.15f}` "
+                  f"| `{float(algo['runs'][-1]['error']):.2e}` |"
+              )
+          lines.append("")
+
+          # Embed the deep markdown report
+          with open('race-results/deep.md') as f:
+              deep_md = f.read()
+          # Drop the top-level H2 (we already have our own header)
+          deep_md = '\n'.join(deep_md.split('\n')[1:]).lstrip('\n')
+          lines.append("<details>")
+          lines.append("<summary>📊 Full deep-tier report (click to expand)</summary>")
+          lines.append("")
+          lines.append(deep_md)
+          lines.append("</details>")
+          lines.append("")
+
+          # Nano and standard collapsible
+          for tier_name, fname in [("standard", "standard"), ("nano (CI-speed)", "nano")]:
+              with open(f'race-results/{fname}.md') as f:
+                  md = '\n'.join(f.read().split('\n')[1:]).lstrip('\n')
+              lines.append(f"<details>")
+              lines.append(f"<summary>📋 {tier_name} tier</summary>")
+              lines.append("")
+              lines.append(md)
+              lines.append("</details>")
+              lines.append("")
+
+          lines.append("<!-- RACE_RESULTS_END -->")
+
+          with open('race-section.md', 'w') as f:
+              f.write('\n'.join(lines) + '\n')
+
+          print("race-section.md written")
+          print(f"Winner: {winner['name']} with {winner['best_digits']} digits")
+          PYEOF
+
+      - name: Inject results into README
+        run: |
+          python3 << 'PYEOF'
+          with open('README.md', 'r') as f:
+              readme = f.read()
+
+          with open('race-section.md', 'r') as f:
+              section = f.read()
+
+          start_marker = '<!-- RACE_RESULTS_START -->'
+          end_marker   = '<!-- RACE_RESULTS_END -->'
+
+          if start_marker in readme and end_marker in readme:
+              before = readme[:readme.index(start_marker)]
+              after  = readme[readme.index(end_marker) + len(end_marker):]
+              readme = before + section + after
+          else:
+              readme = readme + '\n\n' + section
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+
+          print("README.md updated")
+          PYEOF
+
+      - name: Save artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-results-${{ github.run_number }}
+          path: race-results/
+          retention-days: 90
+
+      - name: Commit updated README
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "No changes to README — skipping commit"
+          else
+            git commit -m "docs(race): update results [$(date -u +%Y-%m-%d)] [skip ci]"
+            git push
+          fi
+
+      - name: Post summary
+        run: |
+          cat race-results/deep.md >> $GITHUB_STEP_SUMMARY

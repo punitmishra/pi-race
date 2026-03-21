@@ -1,0 +1,183 @@
+# ─── Auto-tag: bump semver and trigger release weekly or manually ─
+name: 🏷 Auto Tag & Release
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Monday 03:00 UTC (after race-report runs)
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+      tier:
+        description: "Benchmark tier for the race report before tagging"
+        required: false
+        default: "extreme"
+        type: choice
+        options: [standard, deep, extreme]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    name: Bump Version & Tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-tag-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      # ── Run extreme/deep tier and commit README update before tagging
+      - name: Run pre-release race
+        run: |
+          TIER=${{ github.event.inputs.tier || 'extreme' }}
+          mkdir -p race-results
+          ./target/release/pi-race --tier $TIER --format markdown 2>/dev/null > race-results/prerelease.md
+          ./target/release/pi-race --tier $TIER --format json     2>/dev/null > race-results/prerelease.json
+          echo "Pre-release race completed (tier: $TIER)"
+
+      - name: Update README with pre-release results
+        run: |
+          python3 << 'PYEOF'
+          import json, datetime, os
+
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          sha     = os.environ['GITHUB_SHA'][:7]
+          ts      = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+          with open('race-results/prerelease.json') as f:
+              data = json.load(f)
+
+          winner = max(data['algorithms'], key=lambda a: a['best_digits'])
+
+          with open('race-results/prerelease.md') as f:
+              deep_md = '\n'.join(f.read().split('\n')[1:]).lstrip('\n')
+
+          sorted_algos = sorted(data['algorithms'], key=lambda a: -a['best_digits'])
+          medals = ["🥇","🥈","🥉","4️⃣"]
+
+          lines = [
+              "<!-- RACE_RESULTS_START -->",
+              "",
+              "## 🏁 Latest Race Results",
+              "",
+              f"> 🕐 **Updated:** {ts} &nbsp;|&nbsp; **Commit:** [`{sha}`]({run_url}) &nbsp;|&nbsp; **Winner:** **{winner['name']}** with `{winner['best_digits']}` correct digits &nbsp;|&nbsp; **Tier:** `{data['tier']}`",
+              "",
+              "### Quick Look",
+              "",
+              "| Algorithm | Best Digits | Estimate | Error |",
+              "|-----------|-------------|----------|-------|",
+          ]
+          for i, algo in enumerate(sorted_algos):
+              lines.append(
+                  f"| {medals[i]} **{algo['name']}** | `{algo['best_digits']}` "
+                  f"| `{algo['best_estimate']:.15f}` "
+                  f"| `{float(algo['runs'][-1]['error']):.2e}` |"
+              )
+          lines += [
+              "",
+              "<details>",
+              f"<summary>📊 Full {data['tier']}-tier report (click to expand)</summary>",
+              "",
+              deep_md,
+              "</details>",
+              "",
+              "<!-- RACE_RESULTS_END -->",
+          ]
+
+          with open('README.md', 'r') as f:
+              readme = f.read()
+
+          section = '\n'.join(lines) + '\n'
+          start_m = '<!-- RACE_RESULTS_START -->'
+          end_m   = '<!-- RACE_RESULTS_END -->'
+
+          if start_m in readme and end_m in readme:
+              before  = readme[:readme.index(start_m)]
+              after   = readme[readme.index(end_m) + len(end_m):]
+              readme  = before + section + after
+          else:
+              readme  = readme + '\n\n' + section
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+          print(f"README updated — winner: {winner['name']}")
+          PYEOF
+
+      - name: Compute next version
+        id: version
+        run: |
+          # Get latest tag or seed at v0.0.0
+          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST"
+
+          # Strip leading v
+          VER="${LATEST#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VER"
+          BUMP="${{ github.event.inputs.bump || 'patch' }}"
+
+          case $BUMP in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "prev_tag=$LATEST"  >> $GITHUB_OUTPUT
+          echo "bump=$BUMP"        >> $GITHUB_OUTPUT
+          echo "New tag: $NEW_TAG (bump: $BUMP)"
+
+      - name: Update Cargo.toml version
+        run: |
+          NEW="${{ steps.version.outputs.new_tag }}"
+          VER="${NEW#v}"
+          sed -i "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
+          echo "Cargo.toml version → $VER"
+
+      - name: Commit version bump + README
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md Cargo.toml
+          git commit -m "chore: release ${{ steps.version.outputs.new_tag }} [skip ci]"
+          git push
+
+      - name: Create and push tag
+        run: |
+          TAG="${{ steps.version.outputs.new_tag }}"
+          git tag -a "$TAG" -m "Release $TAG — automated by auto-tag workflow"
+          git push origin "$TAG"
+          echo "✅ Pushed tag $TAG — release workflow will now fire"
+
+      - name: Summary
+        run: |
+          echo "## 🏷 Tagged ${{ steps.version.outputs.new_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous:** \`${{ steps.version.outputs.prev_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **New:** \`${{ steps.version.outputs.new_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bump type:** \`${{ steps.version.outputs.bump }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Release workflow will start automatically." >> $GITHUB_STEP_SUMMARY
