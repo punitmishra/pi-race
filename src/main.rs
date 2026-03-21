@@ -242,7 +242,7 @@ fn print_header() {
             a.color(),
             a.label()
         );
-        println!("  {}  {}{}", " ", DIM, a.formula());
+        println!("     {}{}", DIM, a.formula());
         print!("{}", RESET);
     }
     println!();
