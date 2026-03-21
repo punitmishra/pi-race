@@ -1,0 +1,146 @@
+name: 🔵 The Race to Pi
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:       # Manual trigger from GitHub UI
+  schedule:
+    - cron: '0 0 * * 1'   # Weekly Monday midnight UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  race:
+    name: Algorithm Showdown
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Lint (fmt)
+        run: cargo fmt --check
+
+      - name: Lint (clippy)
+        run: cargo clippy -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: 🔵 Run the Race
+        id: race
+        run: |
+          echo "## 🔵 The Race to π — Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ./target/release/pi-race 2>/dev/null >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Also capture plain output for artifact
+          ./target/release/pi-race 2>/dev/null > race-results.txt
+          cat race-results.txt
+
+      - name: Upload race results
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-race-results-${{ github.run_number }}
+          path: race-results.txt
+          retention-days: 30
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-race-linux-x86_64-${{ github.run_number }}
+          path: target/release/pi-race
+          retention-days: 7
+
+  bench:
+    name: Benchmark (nightly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Timed benchmark (10 runs)
+        run: |
+          echo "## ⏱ Benchmark — 10 runs" >> $GITHUB_STEP_SUMMARY
+          echo '| Run | Time (ms) |' >> $GITHUB_STEP_SUMMARY
+          echo '|-----|-----------|' >> $GITHUB_STEP_SUMMARY
+          for i in $(seq 1 10); do
+            T=$( { time ./target/release/pi-race > /dev/null 2>&1 ; } 2>&1 | grep real | awk '{print $2}')
+            echo "| $i | $T |" >> $GITHUB_STEP_SUMMARY
+          done
+
+  cross-compile:
+    name: Cross-compile (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: pi-race
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: pi-race
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: pi-race.exe
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-race-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          retention-days: 14
